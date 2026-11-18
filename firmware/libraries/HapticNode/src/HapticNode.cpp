@@ -1,0 +1,502 @@
+#include "HapticNode.h"
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLE2902.h>
+#include <atomic>
+
+// 已确认的 DRV2605LDGSR 接线：
+// ESP32 GPIO4 -> SCL，GPIO3 -> SDA，GPIO2 -> EN（高电平使能）。
+// SCL/SDA 使用外部上拉，EN 不使用外部上拉，由 MCU 主动驱动。
+constexpr int DRV_SDA_PIN = 3;
+constexpr int DRV_SCL_PIN = 4;
+constexpr int DRV_EN_PIN = 2;
+constexpr uint8_t DRV2605_ADDR_PRIMARY = 0x5A;
+constexpr uint8_t DRV2605_ADDR_ALT = 0x5B;
+constexpr uint8_t DRV_DEFAULT_AMPLITUDE = 100;
+constexpr uint32_t WATCHDOG_MS = 3000;
+constexpr uint32_t EFFECT_POLL_MS = 50;
+
+// DRV2605L register map.
+constexpr uint8_t DRV2605_REG_STATUS = 0x00;
+constexpr uint8_t DRV2605_REG_MODE = 0x01;
+constexpr uint8_t DRV2605_REG_RTPIN = 0x02;
+constexpr uint8_t DRV2605_REG_LIBRARY = 0x03;
+constexpr uint8_t DRV2605_REG_WAVESEQ1 = 0x04;
+constexpr uint8_t DRV2605_REG_WAVESEQ2 = 0x05;
+constexpr uint8_t DRV2605_REG_GO = 0x0C;
+constexpr uint8_t DRV2605_REG_OVERDRIVE = 0x0D;
+constexpr uint8_t DRV2605_REG_SUSTAINPOS = 0x0E;
+constexpr uint8_t DRV2605_REG_SUSTAINNEG = 0x0F;
+constexpr uint8_t DRV2605_REG_BREAK = 0x10;
+constexpr uint8_t DRV2605_REG_AUDIOMAX = 0x13;
+constexpr uint8_t DRV2605_REG_FEEDBACK = 0x1A;
+
+constexpr uint8_t DRV2605_MODE_INTTRIG = 0x00;
+constexpr uint8_t DRV2605_MODE_RTP = 0x05;
+const char *SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+const char *RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
+const char *TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
+namespace {
+struct Command { char text[64]; bool ble; uint32_t generation; };
+char nodeHand;
+const char *nodeName;
+String requestId;
+std::atomic<uint32_t> generation(0);
+std::atomic<bool> bleQueueFull(false);
+QueueHandle_t commands;
+BLECharacteristic *tx;
+std::atomic<bool> connected(false), disconnected(false);
+bool motor = false, ownerBle = false;
+bool drvReady = false;
+uint8_t drvAddr = 0;
+uint8_t drvAmplitude = 0;
+uint8_t drvEffect = 1;
+uint32_t effectStartedMs = 0;
+String drvMode = "INIT";
+uint32_t lastHeartbeat = 0, advertiseAt = 0;
+bool restartAdvertising = false;
+String serialLine;
+bool serialOverflow = false;
+
+enum class ReplySource : uint8_t { BLE, USB, SYSTEM };
+
+const char *sourceName(ReplySource source) {
+  switch (source) {
+    case ReplySource::BLE: return "BLE";
+    case ReplySource::USB: return "USB";
+    default: return "SYSTEM";
+  }
+}
+
+void serialReply(const String &line) {
+#if ARDUINO_USB_CDC_ON_BOOT
+  // BLE replies are also mirrored to USB. Skip the mirror if the host is not
+  // connected/reading instead of allowing the USB CDC write to block loop().
+  if (!Serial || Serial.availableForWrite() < (int)(line.length() + 2)) return;
+#endif
+  Serial.println(line);
+}
+
+// 所有 GPIO 操作和回复均在 loop 执行，避免 BLE 回调与串口并发修改状态。
+void reply(String line, ReplySource source) {
+  line += " hand=";
+  line += nodeHand;
+  if (requestId.length()) {
+    line += " id=";
+    line += requestId;
+  }
+  line += " src=";
+  line += sourceName(source);
+  serialReply(line);
+  tx->setValue(line.c_str());
+  if (connected.load()) {
+    line += '\n';
+    // 兼容默认 ATT MTU 23；上位机按换行重组通知。
+    for (size_t i = 0; i < line.length() && connected.load(); i += 20) {
+      String part = line.substring(i, i + 20);
+      tx->setValue(part.c_str());
+      tx->notify();
+      delay(8);
+    }
+  }
+}
+// GPIO 软件 I2C。SDA/SCL 只主动拉低，或释放为输入由外部上拉拉高。
+constexpr uint16_t DRV_I2C_DELAY_US = 2;
+
+void i2cDelay() { delayMicroseconds(DRV_I2C_DELAY_US); }
+void i2cSdaHigh() { pinMode(DRV_SDA_PIN, INPUT_PULLUP); }
+void i2cSdaLow() { pinMode(DRV_SDA_PIN, OUTPUT); digitalWrite(DRV_SDA_PIN, LOW); }
+void i2cSclHigh() { pinMode(DRV_SCL_PIN, INPUT_PULLUP); }
+void i2cSclLow() { pinMode(DRV_SCL_PIN, OUTPUT); digitalWrite(DRV_SCL_PIN, LOW); }
+bool i2cSdaRead() { return digitalRead(DRV_SDA_PIN); }
+
+void i2cStart() {
+  i2cSdaHigh(); i2cSclHigh(); i2cDelay();
+  i2cSdaLow(); i2cDelay();
+  i2cSclLow(); i2cDelay();
+}
+
+void i2cStop() {
+  i2cSdaLow(); i2cDelay();
+  i2cSclHigh(); i2cDelay();
+  i2cSdaHigh(); i2cDelay();
+}
+
+bool i2cWriteByte(uint8_t value) {
+  for (int bit = 7; bit >= 0; --bit) {
+    if (value & (1U << bit)) i2cSdaHigh(); else i2cSdaLow();
+    i2cDelay();
+    i2cSclHigh(); i2cDelay();
+    i2cSclLow(); i2cDelay();
+  }
+  i2cSdaHigh(); i2cDelay();
+  i2cSclHigh(); i2cDelay();
+  bool ack = !i2cSdaRead();
+  i2cSclLow(); i2cDelay();
+  return ack;
+}
+
+uint8_t i2cReadByte(bool ack) {
+  uint8_t value = 0;
+  i2cSdaHigh();
+  for (int bit = 7; bit >= 0; --bit) {
+    i2cDelay();
+    i2cSclHigh(); i2cDelay();
+    if (i2cSdaRead()) value |= (1U << bit);
+    i2cSclLow(); i2cDelay();
+  }
+  if (ack) i2cSdaLow(); else i2cSdaHigh();
+  i2cDelay();
+  i2cSclHigh(); i2cDelay();
+  i2cSclLow(); i2cSdaHigh(); i2cDelay();
+  return value;
+}
+
+bool drvPing(uint8_t address) {
+  i2cStart();
+  bool ack = i2cWriteByte((uint8_t)(address << 1));
+  i2cStop();
+  return ack;
+}
+
+bool drvWriteRaw(uint8_t address, uint8_t reg, uint8_t value) {
+  i2cStart();
+  bool ok = i2cWriteByte((uint8_t)(address << 1));
+  ok &= i2cWriteByte(reg);
+  ok &= i2cWriteByte(value);
+  i2cStop();
+  return ok;
+}
+
+uint8_t drvReadRaw(uint8_t address, uint8_t reg) {
+  i2cStart();
+  bool ok = i2cWriteByte((uint8_t)(address << 1));
+  ok &= i2cWriteByte(reg);
+  if (!ok) { i2cStop(); return 0xFF; }
+  i2cStart();
+  ok = i2cWriteByte((uint8_t)((address << 1) | 1));
+  if (!ok) { i2cStop(); return 0xFF; }
+  uint8_t value = i2cReadByte(false);
+  i2cStop();
+  return value;
+}
+
+bool drvWriteReg(uint8_t reg, uint8_t value) {
+  if (!drvReady) return false;
+  return drvWriteRaw(drvAddr, reg, value);
+}
+
+uint8_t drvReadReg(uint8_t reg) {
+  if (!drvReady) return 0xFF;
+  return drvReadRaw(drvAddr, reg);
+}
+
+bool drvBegin();
+
+bool drvEnsureReady() {
+  if (drvReady) return true;
+  return drvBegin();
+}
+
+void drvHoldDisabled() {
+  // 先启用内部下拉，再切换为输出低电平，避免 EN 引脚上电时悬空。
+  pinMode(DRV_EN_PIN, INPUT_PULLDOWN);
+  digitalWrite(DRV_EN_PIN, LOW);
+  pinMode(DRV_EN_PIN, OUTPUT);
+  digitalWrite(DRV_EN_PIN, LOW);
+}
+
+bool drvBegin() {
+  // EN 没有外部上拉，配置前先明确保持低电平；随后先拉高，再开始 I2C。
+  drvHoldDisabled();
+  drvAddr = 0;
+  pinMode(DRV_SDA_PIN, INPUT_PULLUP);
+  pinMode(DRV_SCL_PIN, INPUT_PULLUP);
+  digitalWrite(DRV_EN_PIN, HIGH);
+  delay(5);  // 先保证逻辑分析仪能看到 EN 上升，再等待 DRV2605L 就绪。
+  if (drvPing(DRV2605_ADDR_PRIMARY)) drvAddr = DRV2605_ADDR_PRIMARY;
+  else if (drvPing(DRV2605_ADDR_ALT)) drvAddr = DRV2605_ADDR_ALT;
+  else {
+    drvReady = false;
+    drvMode = "ERROR";
+    drvHoldDisabled();
+    return false;
+  }
+
+  bool ok = true;
+  ok &= drvWriteRaw(drvAddr, DRV2605_REG_MODE, DRV2605_MODE_INTTRIG);
+  ok &= drvWriteRaw(drvAddr, DRV2605_REG_RTPIN, 0x00);
+  ok &= drvWriteRaw(drvAddr, DRV2605_REG_WAVESEQ1, 1);
+  ok &= drvWriteRaw(drvAddr, DRV2605_REG_WAVESEQ2, 0);
+  ok &= drvWriteRaw(drvAddr, DRV2605_REG_OVERDRIVE, 0x00);
+  ok &= drvWriteRaw(drvAddr, DRV2605_REG_SUSTAINPOS, 0x00);
+  ok &= drvWriteRaw(drvAddr, DRV2605_REG_SUSTAINNEG, 0x00);
+  ok &= drvWriteRaw(drvAddr, DRV2605_REG_BREAK, 0x00);
+  ok &= drvWriteRaw(drvAddr, DRV2605_REG_AUDIOMAX, 0x64);
+
+  // 项目硬件使用 ERM 马达；如果实际换成 LRA，需要把这一位改为置 1。
+  uint8_t feedback = drvReadRaw(drvAddr, DRV2605_REG_FEEDBACK);
+  if (feedback == 0xFF) ok = false;
+  else ok &= drvWriteRaw(drvAddr, DRV2605_REG_FEEDBACK, feedback & 0x7F);
+
+  ok &= drvWriteRaw(drvAddr, DRV2605_REG_LIBRARY, 1);
+  ok &= drvWriteRaw(drvAddr, DRV2605_REG_MODE, DRV2605_MODE_INTTRIG);
+  drvReady = ok;
+  drvMode = ok ? "READY" : "ERROR";
+  if (!ok) drvHoldDisabled();
+  return ok;
+}
+
+void drvFail() {
+  drvHoldDisabled();
+  motor = false;
+  drvAmplitude = 0;
+  drvReady = false;
+  drvMode = "ERROR";
+}
+
+bool drvStop() {
+  if (!drvReady) {
+    drvFail();
+    return false;
+  }
+  bool ok = drvWriteReg(DRV2605_REG_RTPIN, 0x00);
+  ok &= drvWriteReg(DRV2605_REG_GO, 0x00);
+  ok &= drvWriteReg(DRV2605_REG_MODE, DRV2605_MODE_INTTRIG);
+  if (!ok) {
+    drvFail();
+    return false;
+  }
+  motor = false;
+  drvAmplitude = 0;
+  drvMode = "STOP";
+  return true;
+}
+
+bool drvSetRtp(uint8_t amplitude) {
+  if (!drvReady || amplitude > 127) return false;
+  bool ok = drvWriteReg(DRV2605_REG_GO, 0x00);
+  ok &= drvWriteReg(DRV2605_REG_MODE, DRV2605_MODE_RTP);
+  ok &= drvWriteReg(DRV2605_REG_RTPIN, amplitude);
+  if (!ok) { drvFail(); return false; }
+  motor = amplitude > 0;
+  drvAmplitude = amplitude;
+  drvMode = motor ? "RTP" : "STOP";
+  return true;
+}
+
+bool drvPlayEffect(uint8_t effect) {
+  if (!drvReady || effect > 123) return false;
+  bool ok = drvWriteReg(DRV2605_REG_RTPIN, 0x00);
+  ok &= drvWriteReg(DRV2605_REG_MODE, DRV2605_MODE_INTTRIG);
+  ok &= drvWriteReg(DRV2605_REG_LIBRARY, 1);
+  ok &= drvWriteReg(DRV2605_REG_WAVESEQ1, effect);
+  ok &= drvWriteReg(DRV2605_REG_WAVESEQ2, 0x00);
+  ok &= drvWriteReg(DRV2605_REG_GO, 0x01);
+  if (!ok) { drvFail(); return false; }
+  motor = true;
+  drvAmplitude = 0;
+  drvEffect = effect;
+  drvMode = "EFFECT";
+  effectStartedMs = millis();
+  return true;
+}
+
+void drvTick() {
+  if (!motor || drvMode != "EFFECT" || millis() - effectStartedMs < EFFECT_POLL_MS) return;
+  effectStartedMs = millis();
+  uint8_t go = drvReadReg(DRV2605_REG_GO);
+  if (go == 0xFF) {
+    drvFail();
+    reply("ERR DRV_I2C", ReplySource::SYSTEM);
+  } else if (!(go & 1)) {
+    motor = false;
+    drvMode = "READY";
+  }
+}
+
+void status(ReplySource source) {
+  uint8_t drvStatus = drvReady ? drvReadReg(DRV2605_REG_STATUS) : 0xFF;
+  String line = String("STATUS motor=") + (motor ? "1" : "0") +
+                " protocol=4 ble=" + (connected.load() ? "1" : "0") +
+                " drv=" + (drvReady ? "OK" : "ERR") +
+                " addr=0x" + String(drvAddr, HEX) +
+                " sda=" + String(DRV_SDA_PIN) +
+                " scl=" + String(DRV_SCL_PIN) +
+                " en=" + String(digitalRead(DRV_EN_PIN)) +
+                " mode=" + drvMode +
+                " effect=" + String(drvEffect) +
+                " rtp=" + String(drvAmplitude) +
+                " drvstatus=0x" + String(drvStatus, HEX);
+  reply(line, source);
+}
+
+bool readNumber(const String &text, int limit, int &value) {
+  if (!text.length()) return false;
+  value = 0;
+  for (size_t i = 0; i < text.length(); ++i) {
+    char digit = text[i];
+    if (digit < '0' || digit > '9') return false;
+    value = value * 10 + digit - '0';
+    if (value > limit) return false;
+  }
+  return true;
+}
+
+void stopMotor(ReplySource source) {
+  reply(drvStop() ? "OK OFF" : "ERR DRV_I2C", source);
+  status(source);
+}
+
+void handleText(String s, bool ble, ReplySource source) {
+  s.trim();
+  s.toLowerCase();
+  if (s == "off" || s == "0") {
+    stopMotor(source);
+  } else if (s == "on" || s == "1" || s.startsWith("effect ") || s.startsWith("rtp ")) {
+    bool effect = s.startsWith("effect ");
+    bool rtp = s.startsWith("rtp ");
+    int value = DRV_DEFAULT_AMPLITUDE;
+    if ((effect || rtp) && !readNumber(s.substring(effect ? 7 : 4), effect ? 123 : 127, value)) {
+      reply(effect ? "ERR EFFECT_RANGE" : "ERR RTP_RANGE", source);
+      return;
+    }
+    if (rtp && value == 0) { stopMotor(source); return; }
+    if (motor && ownerBle != ble) { reply("ERR BUSY", source); return; }
+    if (!drvEnsureReady()) { reply("ERR DRV_NOT_READY", source); status(source); return; }
+    if (!(effect ? drvPlayEffect(value) : drvSetRtp(value))) {
+      reply("ERR DRV_I2C", source); status(source); return;
+    }
+    ownerBle = ble;
+    lastHeartbeat = millis();
+    if (effect) reply("OK EFFECT " + String(value), source);
+    else if (rtp) reply("OK RTP " + String(value), source);
+    else reply("OK ON", source);
+    status(source);
+  } else if (s == "ping") {
+    if (motor && ownerBle == ble) lastHeartbeat = millis();
+    reply("PONG", source);
+  } else if (s == "i2cscan" || s == "scan") {
+    // Enable an uninitialized driver just long enough to probe it.
+    bool wasDisabled = !digitalRead(DRV_EN_PIN);
+    if (wasDisabled) { digitalWrite(DRV_EN_PIN, HIGH); delay(5); }
+    bool primary = drvPing(DRV2605_ADDR_PRIMARY);
+    bool alternate = drvPing(DRV2605_ADDR_ALT);
+    if (wasDisabled) drvHoldDisabled();
+    reply(String("I2CSCAN 0x5A=") + (primary ? "ACK" : "NO") +
+          " 0x5B=" + (alternate ? "ACK" : "NO"), source);
+  } else if (s == "status" || s == "s") status(source);
+  else if (s == "help" || s == "h") reply("HELP on off status i2cscan effect 0-123 rtp 0-127 ping help", source);
+  else reply("ERR COMMAND", source);
+}
+
+void handle(const Command &command) {
+  if (command.ble && (!connected.load() || command.generation != generation.load())) return;
+  ReplySource source = command.ble ? ReplySource::BLE : ReplySource::USB;
+  String text(command.text);
+  text.trim();
+  if (text.startsWith("@")) {
+    bool valid = text.length() > 6 && text[5] == ' ';
+    for (size_t i = 1; valid && i <= 4; ++i) {
+      char c = text[i];
+      valid = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F');
+    }
+    if (!valid) { reply("ERR REQUEST_ID", source); return; }
+    requestId = text.substring(1, 5);
+    text.remove(0, 6);
+  }
+  if (text.indexOf('\r') >= 0 || text.indexOf('\n') >= 0) reply("ERR COMMAND", source);
+  else handleText(text, command.ble, source);
+  requestId = "";
+}
+
+class ServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer *) override { connected.store(true); }
+  void onDisconnect(BLEServer *) override {
+    connected.store(false);
+    generation.fetch_add(1);
+    disconnected.store(true);
+  }
+};
+class RxCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *ch) override {
+    auto value = ch->getValue();
+    Command c = {}; c.ble = true;
+    // 单次 GATT 写入是一个命令（允许末尾 CR/LF），不接受多命令拼接。
+    if (!connected.load() || value.length() >= sizeof(c.text)) return;
+    c.generation = generation.load();
+    if (memchr(value.c_str(), '\0', value.length())) return;
+    memcpy(c.text, value.c_str(), value.length());
+    if (xQueueSend(commands, &c, 0) != pdTRUE) bleQueueFull.store(true);
+  }
+};
+}  // namespace
+
+void hapticSetup(char hand, const char *name) {
+  nodeHand = hand;
+  nodeName = name;
+  drvHoldDisabled();
+  Serial.begin(115200);  // USB CDC On Boot 必须 Enabled，不等待电脑打开串口。
+#if ARDUINO_USB_CDC_ON_BOOT
+  Serial.setTxTimeoutMs(1);  // 串口无人读取时快速放弃，不能阻塞 BLE 主循环。
+#endif
+  // 在任何 BLE 初始化之前先启动软件 I2C，便于逻辑分析仪尽早看到 EN/I2C 时序。
+  drvReady = drvBegin();
+  commands = xQueueCreate(16, sizeof(Command));
+  if (!commands) { while (true) delay(1000); }
+  BLEDevice::init(nodeName);
+  BLEServer *server = BLEDevice::createServer();
+  server->setCallbacks(new ServerCallbacks());
+  BLEService *service = server->createService(SERVICE_UUID);
+  tx = service->createCharacteristic(TX_UUID,
+    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  tx->addDescriptor(new BLE2902());
+  BLECharacteristic *rx = service->createCharacteristic(RX_UUID,
+    BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+  rx->setCallbacks(new RxCallbacks());
+  service->start();
+  BLEAdvertising *adv = BLEDevice::getAdvertising();
+  adv->addServiceUUID(SERVICE_UUID);
+  // 名字放扫描响应，避免 128 位服务 UUID 和设备名挤满广播包。
+  BLEAdvertisementData scanResponse; scanResponse.setName(nodeName);
+  adv->setScanResponseData(scanResponse);
+  adv->setScanResponse(true);
+  adv->start();
+  reply(String("READY ") + nodeName + " protocol=4 drv=" + (drvReady ? "OK" : "ERR"), ReplySource::SYSTEM);
+  status(ReplySource::SYSTEM);
+}
+void hapticLoop() {
+  if (disconnected.exchange(false)) {
+    if (motor && ownerBle) { drvStop(); reply("EVENT BLE_LOST OFF", ReplySource::SYSTEM); status(ReplySource::SYSTEM); }
+    advertiseAt = millis() + 500; restartAdvertising = true;
+  }
+  if (restartAdvertising && int32_t(millis() - advertiseAt) >= 0) {
+    if (!connected.load()) BLEDevice::startAdvertising();
+    restartAdvertising = false;
+  }
+  if (motor && millis() - lastHeartbeat >= WATCHDOG_MS) {
+    drvStop(); reply("EVENT TIMEOUT OFF", ReplySource::SYSTEM); status(ReplySource::SYSTEM);
+  }
+  drvTick();
+  if (bleQueueFull.exchange(false) && connected.load()) reply("ERR QUEUE_FULL", ReplySource::BLE);
+  // 每轮最多处理 128 字节，避免持续串口输入饿死超时检查。
+  for (int n = 0; n < 128 && Serial.available(); ++n) {
+    char ch = Serial.read();
+    if (ch == '\n' || ch == '\r') {
+      if (serialOverflow) reply("ERR TOO_LONG", ReplySource::USB);
+      else if (serialLine.length()) {
+        Command c = {}; serialLine.toCharArray(c.text, sizeof(c.text));
+        if (xQueueSend(commands, &c, 0) != pdTRUE) reply("ERR QUEUE_FULL", ReplySource::USB);
+      }
+      serialLine = ""; serialOverflow = false;
+    } else if (!serialOverflow) {
+      if (ch == '\0') serialOverflow = true;
+      else if (serialLine.length() < 63) serialLine += ch;
+      else serialOverflow = true;
+    }
+  }
+  Command c;
+  if (xQueueReceive(commands, &c, 0) == pdTRUE) handle(c);
+  delay(2);
+}
